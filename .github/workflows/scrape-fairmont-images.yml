@@ -1,11 +1,12 @@
 name: Scrape Fairmont Taghazout images
 
 on:
-  workflow_dispatch: {}   # Lance-le à la demande
+  workflow_dispatch: {}   # Lancer manuellement depuis l’onglet Actions
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -15,7 +16,7 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install Playwright
+      - name: Install Playwright (Chromium + deps)
         run: |
           npm init -y
           npm i playwright@latest
@@ -31,50 +32,89 @@ jobs:
           const URL = 'https://www.fairmont.com/fr/hotels/taghazout/fairmont-taghazout-bay.html';
           const OUT_LIST = 'fairmont_taghazout_images.txt';
           const OUT_DIR = 'images';
-          const ALLOWED = [/fairmont\.com/i, /ahstatic\.com/i, /accorhotels/i];
+          const OUT_JSON = 'fairmont_taghazout_images.json';
+          const SCREEN = 'fairmont_after_scroll.png';
+          const STATS = 'fairmont_stats.txt';
 
-          const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+          const UA =
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
           (async () => {
             const browser = await chromium.launch({ headless: true });
-            const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+            const ctx = await browser.newContext({ userAgent: UA });
+            const page = await ctx.newPage();
+
+            const imageUrls = new Set();
+
+            // 1) Capture toutes les réponses images (réseau)
+            page.on('response', async (res) => {
+              try {
+                const ct = (res.headers()['content-type'] || '').toLowerCase();
+                if (ct.startsWith('image/')) imageUrls.add(res.url());
+                else if (res.request().resourceType() === 'image') imageUrls.add(res.url());
+              } catch {}
+            });
+
             await page.goto(URL, { waitUntil: 'networkidle' });
 
-            // Ferme bannières cookies/geo si présentes
-            for (const sel of ['button:has-text("Accepter")','button:has-text("CONFIRMER")']) {
+            // 2) Fermer bannières potentielles
+            for (const sel of [
+              'button:has-text("Accepter")',
+              'button:has-text("CONFIRMER")',
+              'button:has-text("J’accepte")',
+              'button:has-text("Accept")'
+            ]) {
               try { await page.click(sel, { timeout: 2500 }); } catch {}
             }
 
-            // Scroll pour déclencher le lazy-load
-            for (let i = 0; i < 22; i++) { await page.mouse.wheel(0, 1500); await sleep(400); }
+            // 3) Scroll jusqu’à stabilisation pour déclencher le lazy-load
+            let lastH = 0;
+            for (let i = 0; i < 40; i++) {
+              await page.mouse.wheel(0, 1800);
+              await sleep(350);
+              const h = await page.evaluate(() =>
+                document.documentElement.scrollHeight || document.body.scrollHeight
+              );
+              if (Math.abs(h - lastH) < 50) break;
+              lastH = h;
+            }
+            await sleep(1500);
 
-            const urls = new Set();
+            // 4) Extraire aussi depuis le DOM (img/srcset + <source> + background-image)
+            const pushAll = (arr) => arr.forEach((u) => u && imageUrls.add(u));
 
-            // <img src/srcset>
-            const imgUrls = await page.$$eval('img', imgs => imgs.flatMap(img => {
-              const arr = [];
-              if (img.src) arr.push(img.src);
-              if (img.srcset) img.srcset.split(',').forEach(p => {
-                const u = p.trim().split(' ')[0];
-                if (u) arr.push(u);
-              });
-              return arr;
-            }));
-            imgUrls.forEach(u => urls.add(u));
+            const domImg = await page.$$eval('img', (imgs) =>
+              imgs.flatMap((img) => {
+                const out = [];
+                if (img.src) out.push(img.src);
+                if (img.srcset)
+                  img.srcset.split(',').forEach((p) => {
+                    const u = p.trim().split(' ')[0];
+                    if (u) out.push(u);
+                  });
+                return out;
+              })
+            );
+            pushAll(domImg);
 
-            // <source srcset> (picture)
-            const sourceUrls = await page.$$eval('source[srcset]', els => els.flatMap(el =>
-              el.getAttribute('srcset')?.split(',').map(s=>s.trim().split(' ')[0]).filter(Boolean) || []
-            ));
-            sourceUrls.forEach(u => urls.add(u));
+            const domSrc = await page.$$eval('source[srcset]', (els) =>
+              els.flatMap((el) =>
+                (el.getAttribute('srcset') || '')
+                  .split(',')
+                  .map((s) => s.trim().split(' ')[0])
+                  .filter(Boolean)
+              )
+            );
+            pushAll(domSrc);
 
-            // background-image: url(...)
-            const bgUrls = await page.$$eval('*', nodes => {
+            const domBg = await page.$$eval('*', (nodes) => {
               const out = [];
+              const re = /url\((\"|')?(.*?)\1\)/g;
               for (const n of nodes) {
                 const bg = getComputedStyle(n).getPropertyValue('background-image');
                 if (bg && bg.includes('url(')) {
-                  const re = /url\((\"|')?(.*?)\1\)/g; let m;
+                  let m;
                   while ((m = re.exec(bg)) !== null) {
                     const u = m[2];
                     if (u && !u.startsWith('data:')) out.push(u);
@@ -83,41 +123,71 @@ jobs:
               }
               return out;
             });
-            bgUrls.forEach(u => urls.add(u));
+            pushAll(domBg);
 
-            // Normalisation -> absolu + filtre domaines
-            function toAbs(u){ try { return new URL(u, URL).href; } catch { return null; } }
-            const filtered = [...urls].map(toAbs).filter(Boolean).filter(u => ALLOWED.some(rx => rx.test(u)));
+            // 5) Normaliser en URLs absolues
+            function toAbs(u) { try { return new URL(u, URL).href; } catch { return null; } }
+            const list = [...imageUrls].map(toAbs).filter(Boolean);
 
-            // Écriture de la liste
-            await fs.writeFile(OUT_LIST, filtered.join('\n'), 'utf8');
+            // Preuve visuelle
+            await page.screenshot({ path: SCREEN, fullPage: true });
 
-            // Téléchargement
+            // 6) Sauvegarder la liste + meta
+            await fs.writeFile(OUT_LIST, list.join('\n'), 'utf8');
+            await fs.writeFile(
+              OUT_JSON,
+              JSON.stringify({ url: URL, count: list.length, when: new Date().toISOString() }, null, 2)
+            );
+
+            // 7) Télécharger les images (avec Referer + UA)
             await fs.mkdir(OUT_DIR, { recursive: true });
-            for (const u of filtered) {
+            let ok = 0, ko = 0;
+
+            for (const u of list) {
               try {
-                const res = await page.request.get(u);
-                if (!res.ok()) { console.warn('skip', u, res.status()); continue; }
+                const res = await ctx.request.get(u, {
+                  headers: {
+                    'Referer': URL,
+                    'User-Agent': UA,
+                    'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
+                  }
+                });
+                if (!res.ok()) { ko++; continue; }
                 const buf = await res.body();
                 const clean = u.split('?')[0];
                 const base = path.basename(clean || ('img_' + Math.random().toString(36).slice(2) + '.jpg'));
                 await fs.writeFile(path.join(OUT_DIR, base), buf);
-                console.log('↓', base);
-              } catch (e) {
-                console.warn('err', u, e?.message);
+                ok++;
+              } catch {
+                ko++;
               }
             }
 
+            await fs.writeFile(STATS, `total_urls=${list.length}\nok=${ok}\nko=${ko}\n`, 'utf8');
             await browser.close();
           })();
           EOF
 
       - name: Run scraper
-        run: node scrape-fairmont-images.mjs
+        run: |
+          node scrape-fairmont-images.mjs
+          echo "---- LISTING ----"
+          ls -la
+          echo "---- PREVIEW images/ ----"
+          ls -la images || true
+          echo "---- STATS ----"
+          cat fairmont_stats.txt || true
+          echo "---- JSON ----"
+          cat fairmont_taghazout_images.json || true
 
       - name: Zip results
         run: |
-          zip -r fairmont_taghazout_images.zip images fairmont_taghazout_images.txt
+          zip -r fairmont_taghazout_images.zip \
+            images \
+            fairmont_taghazout_images.txt \
+            fairmont_taghazout_images.json \
+            fairmont_after_scroll.png \
+            fairmont_stats.txt || true
 
       - name: Upload artifact (ZIP)
         uses: actions/upload-artifact@v4
