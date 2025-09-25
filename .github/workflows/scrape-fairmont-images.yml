@@ -1,0 +1,126 @@
+name: Scrape Fairmont Taghazout images
+
+on:
+  workflow_dispatch: {}   # Lance-le à la demande
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Playwright
+        run: |
+          npm init -y
+          npm i playwright@latest
+          npx playwright install --with-deps chromium
+
+      - name: Write scraper script
+        run: |
+          cat > scrape-fairmont-images.mjs <<'EOF'
+          import fs from 'fs/promises';
+          import path from 'path';
+          import { chromium } from 'playwright';
+
+          const URL = 'https://www.fairmont.com/fr/hotels/taghazout/fairmont-taghazout-bay.html';
+          const OUT_LIST = 'fairmont_taghazout_images.txt';
+          const OUT_DIR = 'images';
+          const ALLOWED = [/fairmont\.com/i, /ahstatic\.com/i, /accorhotels/i];
+
+          const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+
+          (async () => {
+            const browser = await chromium.launch({ headless: true });
+            const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+            await page.goto(URL, { waitUntil: 'networkidle' });
+
+            // Ferme bannières cookies/geo si présentes
+            for (const sel of ['button:has-text("Accepter")','button:has-text("CONFIRMER")']) {
+              try { await page.click(sel, { timeout: 2500 }); } catch {}
+            }
+
+            // Scroll pour déclencher le lazy-load
+            for (let i = 0; i < 22; i++) { await page.mouse.wheel(0, 1500); await sleep(400); }
+
+            const urls = new Set();
+
+            // <img src/srcset>
+            const imgUrls = await page.$$eval('img', imgs => imgs.flatMap(img => {
+              const arr = [];
+              if (img.src) arr.push(img.src);
+              if (img.srcset) img.srcset.split(',').forEach(p => {
+                const u = p.trim().split(' ')[0];
+                if (u) arr.push(u);
+              });
+              return arr;
+            }));
+            imgUrls.forEach(u => urls.add(u));
+
+            // <source srcset> (picture)
+            const sourceUrls = await page.$$eval('source[srcset]', els => els.flatMap(el =>
+              el.getAttribute('srcset')?.split(',').map(s=>s.trim().split(' ')[0]).filter(Boolean) || []
+            ));
+            sourceUrls.forEach(u => urls.add(u));
+
+            // background-image: url(...)
+            const bgUrls = await page.$$eval('*', nodes => {
+              const out = [];
+              for (const n of nodes) {
+                const bg = getComputedStyle(n).getPropertyValue('background-image');
+                if (bg && bg.includes('url(')) {
+                  const re = /url\((\"|')?(.*?)\1\)/g; let m;
+                  while ((m = re.exec(bg)) !== null) {
+                    const u = m[2];
+                    if (u && !u.startsWith('data:')) out.push(u);
+                  }
+                }
+              }
+              return out;
+            });
+            bgUrls.forEach(u => urls.add(u));
+
+            // Normalisation -> absolu + filtre domaines
+            function toAbs(u){ try { return new URL(u, URL).href; } catch { return null; } }
+            const filtered = [...urls].map(toAbs).filter(Boolean).filter(u => ALLOWED.some(rx => rx.test(u)));
+
+            // Écriture de la liste
+            await fs.writeFile(OUT_LIST, filtered.join('\n'), 'utf8');
+
+            // Téléchargement
+            await fs.mkdir(OUT_DIR, { recursive: true });
+            for (const u of filtered) {
+              try {
+                const res = await page.request.get(u);
+                if (!res.ok()) { console.warn('skip', u, res.status()); continue; }
+                const buf = await res.body();
+                const clean = u.split('?')[0];
+                const base = path.basename(clean || ('img_' + Math.random().toString(36).slice(2) + '.jpg'));
+                await fs.writeFile(path.join(OUT_DIR, base), buf);
+                console.log('↓', base);
+              } catch (e) {
+                console.warn('err', u, e?.message);
+              }
+            }
+
+            await browser.close();
+          })();
+          EOF
+
+      - name: Run scraper
+        run: node scrape-fairmont-images.mjs
+
+      - name: Zip results
+        run: |
+          zip -r fairmont_taghazout_images.zip images fairmont_taghazout_images.txt
+
+      - name: Upload artifact (ZIP)
+        uses: actions/upload-artifact@v4
+        with:
+          name: fairmont_taghazout_images
+          path: fairmont_taghazout_images.zip
